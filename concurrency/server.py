@@ -2,7 +2,7 @@ import logging
 import os
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -12,6 +12,7 @@ from TTS.utils.generic_utils import get_user_data_dir
 from TTS.utils.manage import ModelManager
 import subprocess
 import io
+import struct
 from typing import Optional
 from queue import Queue
 import threading
@@ -108,33 +109,37 @@ class Model:
 
     def get_cloned_voice_latents(self, ref_audio_path):
         """Compute conditioning latents for voice cloning from reference audio."""
+        logging.info(f"Attempting to access reference audio: {ref_audio_path}")
         if not os.path.exists(ref_audio_path):
+            logging.error(f"Reference audio file not found: {ref_audio_path}")
             raise FileNotFoundError(f"Reference audio file not found: {ref_audio_path}")
         
-        # Use get_conditioning_latents to compute latents
-        gpt_cond_latent, speaker_embedding = self.model.get_conditioning_latents(
-            audio_path=ref_audio_path,
-            max_ref_length=30,
-            gpt_cond_len=6,
-            gpt_cond_chunk_len=6,
-            librosa_trim_db=None,
-            sound_norm_refs=False,
-            load_sr=22050
-        )
-        
-        return gpt_cond_latent, speaker_embedding
+        try:
+            gpt_cond_latent, speaker_embedding = self.model.get_conditioning_latents(
+                audio_path=ref_audio_path,
+                max_ref_length=30,
+                gpt_cond_len=6,
+                gpt_cond_chunk_len=6,
+                librosa_trim_db=None,
+                sound_norm_refs=False,
+                load_sr=22050
+            )
+            return gpt_cond_latent, speaker_embedding
+        except Exception as e:
+            logging.error(f"Error computing conditioning latents: {e}")
+            raise
 
     def predict(self, model_input):
         text = model_input.get("text")
         language = model_input.get("language", "en")
         chunk_size = int(model_input.get("chunk_size", 60))
-        ref_audio_path = model_input.get("ref_audio_path")  # Path to reference audio
+        ref_audio_path = model_input.get("ref_audio_path")
+
+        logging.info(f"Predicting with text: {text[:50]}..., language: {language}, chunk_size: {chunk_size}")
 
         if ref_audio_path:
-            # Clone voice from reference audio
             gpt_cond_latent, speaker_embedding = self.get_cloned_voice_latents(ref_audio_path)
         else:
-            # Fallback to default speaker (Ana Florence) if no reference audio is provided
             default_speaker = {
                 "speaker_embedding": self.model.speaker_manager.speakers["Ana Florence"]["speaker_embedding"]
                     .cpu()
@@ -160,21 +165,30 @@ class Model:
                 .to(self.device)
             )
 
-        streamer = self.model.inference_stream(
-            text,
-            language,
-            gpt_cond_latent,
-            speaker_embedding,
-            stream_chunk_size=chunk_size,
-            enable_text_splitting=True,
-            temperature=0.75,
-            speed=0.9
-        )
+        try:
+            streamer = self.model.inference_stream(
+                text,
+                language,
+                gpt_cond_latent,
+                speaker_embedding,
+                stream_chunk_size=chunk_size,
+                enable_text_splitting=True,
+                temperature=0.75,
+                speed=0.9
+            )
+        except Exception as e:
+            logging.error(f"Error initializing inference stream: {e}")
+            raise
 
-        for chunk in streamer:
-            processed_chunk = self.wav_postprocess(chunk)
-            processed_bytes = processed_chunk.tobytes()
-            yield processed_bytes
+        for i, chunk in enumerate(streamer):
+            try:
+                processed_chunk = self.wav_postprocess(chunk)
+                processed_bytes = processed_chunk.tobytes()
+                logging.info(f"Generated chunk {i}: size={len(processed_bytes)} bytes")
+                yield processed_bytes
+            except Exception as e:
+                logging.error(f"Error processing chunk {i}: {e}")
+                raise
 
 # Initialize model
 model = Model()
@@ -189,31 +203,71 @@ class TTSInput(BaseModel):
     language: str = "en"
     chunk_size: int = 60
     output_file: Optional[str] = None
-    ref_audio_path: Optional[str] = None  # New field for reference audio
+    ref_audio_path: Optional[str] = None
+
+def create_wav_header(sample_rate=24000, bits_per_sample=16, channels=1, num_samples=0):
+    """Generate a WAV header for streaming PCM data."""
+    datasize = num_samples * channels * bits_per_sample // 8
+    header = bytearray()
+    
+    # RIFF header
+    header.extend(b"RIFF")
+    header.extend(struct.pack("<L", 36 + datasize))  # Chunk size
+    header.extend(b"WAVE")
+    
+    # fmt subchunk
+    header.extend(b"fmt ")
+    header.extend(struct.pack("<L", 16))  # Subchunk1Size (16 for PCM)
+    header.extend(struct.pack("<H", 1))   # AudioFormat (1 for PCM)
+    header.extend(struct.pack("<H", channels))  # NumChannels
+    header.extend(struct.pack("<L", sample_rate))  # SampleRate
+    header.extend(struct.pack("<L", sample_rate * channels * bits_per_sample // 8))  # ByteRate
+    header.extend(struct.pack("<H", channels * bits_per_sample // 8))  # BlockAlign
+    header.extend(struct.pack("<H", bits_per_sample))  # BitsPerSample
+    
+    # data subchunk
+    header.extend(b"data")
+    header.extend(struct.pack("<L", datasize))  # Subchunk2Size
+    
+    return bytes(header)
 
 def stream_audio(audio_stream, output_file: Optional[str] = None):
-    # Collect audio chunks for queuing
     chunks = []
-    for chunk in audio_stream:
-        chunks.append(chunk)
-        yield chunk  # Stream back to client
-    # Queue audio for playback
+    debug_file = "debug_server.wav"
+    logging.info("Starting audio stream")
+    with open(debug_file, "wb") as f:
+        header = create_wav_header(sample_rate=24000, bits_per_sample=16, channels=1, num_samples=0)
+        f.write(header)
+        yield header
+        try:
+            for i, chunk in enumerate(audio_stream):
+                logging.info(f"Chunk {i}: size={len(chunk)} bytes, first_10={chunk[:10]}")
+                chunks.append(chunk)
+                f.write(chunk)
+                yield chunk
+        except Exception as e:
+            logging.error(f"Error streaming audio: {e}")
+            raise
+    logging.info(f"Saved debug WAV to {debug_file}")
     playback_queue.put((chunks, output_file))
 
 @app.post("/tts/stream")
-async def tts_stream(input: TTSInput):
+async def tts_stream(input: TTSInput, request: Request):
+    request_id = request.headers.get("X-Request-ID", "none")
+    logging.info(f"Received request with ID: {request_id}")
     try:
-        audio_stream = model.predict(input.dict())
+        audio_stream = model.predict(input.model_dump())
         return StreamingResponse(
             stream_audio(audio_stream, input.output_file),
             media_type="audio/wav"
         )
     except Exception as e:
+        logging.error(f"Error processing request {request_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing TTS: {str(e)}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    playback_queue.put((None, None))  # Stop playback worker
+    playback_queue.put((None, None))
 
 if __name__ == "__main__":
     import uvicorn
